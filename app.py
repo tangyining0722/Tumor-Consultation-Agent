@@ -76,7 +76,7 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False, image_base
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            model_id = "ep-2024061112345-abcde" # ⚠️ 请务必替换为你真实的豆包 EP ID
+            model_id = "ep-20261016181503-h42sl" # ⚠️ 请务必替换为你真实的豆包 EP ID
         else: return ""
 
         client = OpenAI(api_key=api_key, base_url=base_url)
