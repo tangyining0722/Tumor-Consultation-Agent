@@ -1,0 +1,7 @@
+streamlit>=1.35,<2
+openai>=1.40,<3
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+pypdf>=4.2,<7
+pydantic>=2.7,<3
+pytest>=8,<10
