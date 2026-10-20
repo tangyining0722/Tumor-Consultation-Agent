@@ -7,14 +7,15 @@ import uuid
 import re
 import sqlite3
 import base64
-import time
+import tempfile
 from datetime import datetime
 from openai import OpenAI
+from gradio_client import Client, handle_file
 
 # ================= 页面配置 =================
 st.set_page_config(page_title="肿瘤 MDT 辅助决策系统", layout="wide")
 st.title("肿瘤 MDT 辅助决策系统 (Clinical Agent)")
-st.caption("面向临床医生的循证医学辅助工具。支持影像双通道分析、双模型对抗、实时文献核查。")
+st.caption("面向临床医生的循证医学辅助工具。支持双通道影像分析、双模型对抗、实时文献核查。")
 
 # ================= 数据库初始化 (记忆功能) =================
 DB_FILE = "tumor_memory.db"
@@ -76,12 +77,11 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False, image_base
             api_key = get_api_key("DOUBAO_API_KEY")
             if not api_key: return ""
             base_url = "https://ark.cn-beijing.volces.com/api/v3"
-            model_id = "ep-20261016181503-h42sl" # ⚠️ 请务必替换为你真实的豆包 EP ID
+            model_id = "ep-20261016181503-h42sl" # ⚠️ 务必换成你真实的豆包视觉模型 EP ID
         else: return ""
 
         client = OpenAI(api_key=api_key, base_url=base_url)
         
-        # 多模态请求
         if image_base64 and model_name == "doubao":
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -100,36 +100,42 @@ def call_llm(model_name, system_prompt, user_prompt, json_mode=False, image_base
         return response.choices[0].message.content
     except Exception: return ""
 
-# ================= 影像分析双通道 =================
+# ================= 【核心】双通道影像分析 =================
 def analyze_image(image_bytes):
-    """双通道影像分析：通道A调用本地/云端专业API，通道B用多模态大模型兜底"""
-    base64_img = base64.b64encode(image_bytes).decode('utf-8')
-    
-    # 【通道 A】：预留你同学包（TumorImagingAgent）的 API 接口
-    IMAGING_API_URL = os.environ.get("IMAGING_API_URL") 
-    if IMAGING_API_URL:
-        try:
-            st.toast("正在调用本地专业影像分割模型...", icon="🧠")
-            res = requests.post(f"{IMAGING_API_URL}/analyze", json={"image": base64_img, "tumor_type": "general"}, timeout=120)
-            return res.json().get("report", "影像 API 返回为空")
-        except Exception as e:
-            st.warning(f"专业影像API调用失败: {e}，将切换至大模型读图。")
+    # 通道 A：调用 PanCancerSeg 专业模型
+    try:
+        st.toast("正在唤醒 PanCancerSeg nnU-Net 专业模型（约需30秒）...", icon="🧠")
+        hf_token = os.environ.get("HF_TOKEN")
+        
+        client = Client("junma/PanCancerSeg-Liver", token=hf_token)
+        
+        # Gradio需要文件路径
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp.write(image_bytes)
+            tmp_path = tmp.name
 
-    # 【通道 B】：使用豆包多模态大模型直接读图（确保在 Render 能跑通）
-    st.toast("正在使用多模态大模型提取影像特征...", icon="👁️")
-    prompt = """
-    你是一位顶级影像科/病理科专家。请详细阅读这张医学图像，提取以下关键信息：
-    1. 图像类型（如CT/X光/病理切片）；
-    2. 主要病灶位置与大小（如最大长径、体积）；
-    3. 形态特征（如边界、密度、毛刺征等）；
-    4. 影像学初步印象（如高度怀疑恶性）。
-    请用专业术语输出纯文本描述。
-    """
-    res = call_llm("doubao", "你是专业的医学影像分析专家。", prompt, json_mode=False, image_base64=base64_img)
-    if not res:
-        return "【影像学分析】未能识别图像内容（请检查豆包视觉模型EP ID是否配置正确）。"
-    
-    return f"【大模型影像特征提取】\n{res}"
+        st.toast("专业模型正在分析（注：若上传JPG格式，API可能报错降级）...", icon="⏳")
+        result = client.predict(
+            input_file=handle_file(tmp_path),
+            api_name="/predict"
+        )
+        os.remove(tmp_path)
+        return f"【专业 nnU-Net 影像分析结果】\n{result}"
+
+    except Exception as e:
+        # 通道 B：降级用豆包视觉模型
+        st.warning(f"⚠️ 专业影像工具调用失败（可能是 JPG 格式不被支持）: {str(e)[:80]}... 已自动降级为多模态大模型识图。")
+        
+        st.toast("正在使用豆包视觉大模型提取特征...", icon="👁️")
+        base64_img = base64.b64encode(image_bytes).decode('utf-8')
+        prompt = """
+        你是一位顶级影像科专家。请详细阅读这张医学图像，提取以下关键信息：
+        1. 图像类型；2. 病灶位置与大小；3. 形态特征；4. 影像学初步印象。请用专业术语输出。
+        """
+        res = call_llm("doubao", "你是专业的医学影像分析专家。", prompt, json_mode=False, image_base64=base64_img)
+        if not res:
+            return "【影像分析失败】请检查豆包视觉模型EP ID配置。"
+        return f"【大模型影像特征提取（降级模式）】\n{res}"
 
 # ================= 文献检索模块 =================
 def search_europepmc(query, max_results=3):
@@ -167,7 +173,6 @@ def generate_report_and_questions(messages_history, current_round):
     else:
         ask_instructions = "4. 达到最大追问轮次，停止追问，questions 数组为空 []。"
 
-    # 主诊医生
     doctor_prompt = f"""
     你是一位顶级肿瘤内科主任。基于以下病历及影像特征：
     {context}
@@ -183,9 +188,8 @@ def generate_report_and_questions(messages_history, current_round):
     """
     doc_res = call_llm("deepseek", "你是一位肿瘤科主任。", doctor_prompt, json_mode=True)
     try: doc_data = json.loads(doc_res.strip().replace("```json", "").replace("```", ""))
-    except: doc_data = {}
+    except: doc_data = {"report": "主诊模型返回异常，请检查 API。", "questions": []}
 
-    # 质控专家（审查）
     quality_prompt = f"""
     你是一位严苛的肿瘤 MDT 质控专家。审查以下报告：
     {doc_data.get('report', '')}
@@ -213,20 +217,19 @@ def generate_report_and_questions(messages_history, current_round):
 def verify_with_literature(report_content):
     english_terms = re.findall(r'[\(（]([A-Za-z\s\-]+)[\)）]', report_content)
     search_query = " AND ".join(english_terms[:2]) if english_terms else "Lung Cancer"
-    
     st.toast(f"正在同时检索 Europe PMC 与 PubMed: {search_query}", icon="🔍")
     return search_europepmc(search_query) + search_pubmed(search_query)
 
 # ================= 界面交互流程 =================
 with st.sidebar:
     st.header("病历数据录入")
-    uploaded_file = st.file_uploader("上传医学影像 (JPG/PNG)", type=["jpg", "jpeg", "png"])
+    uploaded_file = st.file_uploader("上传医学影像 (支持 NIfTI/JPG/PNG)", type=["jpg", "jpeg", "png", "nii", "gz"])
     if uploaded_file is not None:
-        st.image(uploaded_file, caption="已上传影像", use_column_width=True)
+        st.image(uploaded_file, caption="已上传影像（或 NIfTI 数据）", use_container_width=True)
         if st.button("🔍 提取影像特征"):
             with st.spinner("正在分析影像..."):
                 st.session_state.image_analysis = analyze_image(uploaded_file.getvalue())
-                st.success("影像特征提取成功！已注入上下文。")
+                st.success("影像特征提取完毕！已注入上下文。")
 
     if st.button("🔄 开始新病例"):
         for key in list(st.session_state.keys()): del st.session_state[key]
@@ -236,23 +239,26 @@ with st.sidebar:
     st.subheader("🧠 历史记录")
     for h in get_history(): st.caption(f"🕒 {h[0]} | {h[1][:15]}...")
 
-if not st.session_state.messages:
-    st.info("请粘贴患者的电子病历")
-    initial_symptom = st.text_area("病历文本：", height=200)
+if not st.session_state.messages or not st.session_state.report:
+    st.info("请粘贴患者的电子病历（如需纯图像分析，留空直接点击生成）")
+    initial_symptom = st.text_area("病历文本：", height=200, key="initial_input")
     
     if st.button("生成 MDT 辅助决策", type="primary"):
-        combined_symptoms = initial_symptom
-        if st.session_state.image_analysis:
-            combined_symptoms += f"\n\n{st.session_state.image_analysis}"
+        if not initial_symptom.strip() and not st.session_state.image_analysis:
+            st.warning("请输入病历数据或先提取影像特征。")
+        else:
+            combined_symptoms = initial_symptom
+            if st.session_state.image_analysis:
+                combined_symptoms += f"\n\n{st.session_state.image_analysis}"
 
-        st.session_state.messages.append({"role": "user", "content": combined_symptoms})
-        with st.spinner("双模型对抗推理中..."):
-            result = generate_report_and_questions(st.session_state.messages, 0)
-            st.session_state.report = result.get("report", "")
-            st.session_state.questions = result.get("questions", [])
-            st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
-            save_to_memory(combined_symptoms, st.session_state.report)
-            st.rerun()
+            st.session_state.messages.append({"role": "user", "content": combined_symptoms})
+            with st.spinner("双模型对抗推理中..."):
+                result = generate_report_and_questions(st.session_state.messages, 0)
+                st.session_state.report = result.get("report", "")
+                st.session_state.questions = result.get("questions", [])
+                st.session_state.messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
+                save_to_memory(combined_symptoms, st.session_state.report)
+                st.rerun()
 
 if st.session_state.report:
     st.markdown("### 📋 MDT 辅助决策报告")
