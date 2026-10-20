@@ -2,4 +2,4 @@ streamlit
 openai
 requests
 gradio_client
-python-dotenv
+Pillow
